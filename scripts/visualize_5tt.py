@@ -1,27 +1,32 @@
 """
-visualize_5tt.py
-Loads a FreeSurfer 5-tissue-type label volume (5tt.mgz) and displays
-interactive orthogonal slice views + a 3D voxel overview.
+downsample_5tt.py
+Downsamples a 5-tissue-type label volume (5tt.mgz) to a lower resolution
+and exports both a resampled .mgz and a raw binary .bin for MCX input.
 
 Usage:
-    python visualize_5tt.py <path_to_5tt.mgz>
+    python downsample_5tt.py <path_to_5tt.mgz> [--res MM] [--out DIR]
 
-Example:
-    python visualize_5tt.py output/sub-116/mri/5tt.mgz
+Examples:
+    python downsample_5tt.py output/sub-116/mri/5tt.mgz
+    python downsample_5tt.py output/sub-116/mri/5tt.mgz --res 2
+    python downsample_5tt.py output/sub-116/mri/5tt.mgz --res 2 --out output/sub-116/mcx
+
+Arguments:
+    --res MM    Target isotropic resolution in mm (default: 2)
+    --out DIR   Output directory (default: same directory as input file)
+
+Output files:
+    5tt_<MM>mm.mgz              Downsampled label volume
+    5tt_<MM>mm.bin              Raw binary voxel file for MCX (uint8, Fortran order)
+    5tt_<MM>mm_mcx_domain.json  MCX Domain JSON snippet
 
 Dependencies:
-    pip install nibabel numpy matplotlib scipy
-
-Controls:
-    - Slice viewers: click anywhere on a slice to move the crosshair
-    - Sliders: drag to scroll through slices
-    - 3D view: rotate with mouse, scroll to zoom
-    - Opacity slider: adjust tissue transparency in 3D view
-    - Checkboxes: toggle individual tissues on/off
+    pip install nibabel numpy scipy
 """
 
 import sys
 import os
+import json
 import argparse
 import numpy as np
 
@@ -32,399 +37,189 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import matplotlib
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    from matplotlib.widgets import Slider, CheckButtons, Button
-    from mpl_toolkits.mplot3d import Axes3D
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    from scipy.ndimage import zoom
 except ImportError:
-    print("[ERROR] matplotlib not installed. Run: pip install matplotlib")
+    print("[ERROR] scipy not installed. Run: pip install scipy")
     sys.exit(1)
 
-try:
-    from scipy.ndimage import zoom, binary_erosion
-    HAS_SCIPY = True
-except ImportError:
-    print("[WARN] scipy not installed. 3D downsampling will use numpy fallback.")
-    HAS_SCIPY = False
-
-# ── Tissue definitions ────────────────────────────────────────────────────────
 
 TISSUES = {
-    0: {"name": "Background", "color": (0.05, 0.05, 0.05), "alpha": 0.0,  "show": False},
-    1: {"name": "White Matter","color": (0.95, 0.95, 0.85), "alpha": 0.6,  "show": True},
-    2: {"name": "Grey Matter", "color": (0.70, 0.50, 0.50), "alpha": 0.6,  "show": True},
-    3: {"name": "CSF",         "color": (0.30, 0.55, 0.90), "alpha": 0.4,  "show": True},
-    4: {"name": "Skull",       "color": (0.90, 0.82, 0.65), "alpha": 0.3,  "show": True},
-    5: {"name": "Scalp",       "color": (0.92, 0.72, 0.60), "alpha": 0.2,  "show": True},
+    0: "Background",
+    1: "White Matter",
+    2: "Grey Matter",
+    3: "CSF",
+    4: "Skull",
+    5: "Scalp",
 }
 
-# Colourmap for 2D slice views: one distinct colour per label
-SLICE_COLORS = np.array([
-    [0.05, 0.05, 0.05, 1.0],   # 0 Background — near black
-    [0.95, 0.95, 0.85, 1.0],   # 1 White Matter — off white
-    [0.70, 0.50, 0.50, 1.0],   # 2 Grey Matter — dusty rose
-    [0.30, 0.55, 0.90, 1.0],   # 3 CSF — blue
-    [0.90, 0.82, 0.65, 1.0],   # 4 Skull — bone
-    [0.92, 0.72, 0.60, 1.0],   # 5 Scalp — skin
-], dtype=np.float32)
-
-from matplotlib.colors import ListedColormap
-SLICE_CMAP = ListedColormap(SLICE_COLORS)
+# Default optical properties at 750nm (mua mm^-1, mus mm^-1, g, n)
+MCX_OPTICAL_PROPS = {
+    0: [0.000, 0.00, 1.00, 1.00],  # Background / air
+    1: [0.019, 7.80, 0.89, 1.37],  # White Matter
+    2: [0.020, 9.00, 0.89, 1.37],  # Grey Matter
+    3: [0.004, 0.09, 0.89, 1.37],  # CSF
+    4: [0.013, 8.60, 0.89, 1.37],  # Skull
+    5: [0.017, 7.50, 0.89, 1.37],  # Scalp
+}
 
 
-# ── Marching cubes (pure numpy fallback) ─────────────────────────────────────
-
-def extract_surface_marching_cubes(mask, step=2):
+def get_voxel_size_mm(affine):
     """
-    Use scipy's marching cubes if available, otherwise return a point cloud
-    of surface voxels for 3D scatter plotting.
+    Get isotropic voxel size from affine matrix using column norms.
+    FreeSurfer affines are often rotation matrices — the diagonal alone
+    is NOT the voxel size. Column norms give the correct voxel dimensions.
     """
-    try:
-        from scipy.ndimage import binary_erosion
-        from skimage.measure import marching_cubes
-        verts, faces, _, _ = marching_cubes(mask.astype(np.float32), level=0.5, step_size=step)
-        return verts, faces
-    except ImportError:
-        pass
-
-    # Fallback: erode and find surface voxels
-    eroded = binary_erosion(mask) if HAS_SCIPY else mask
-    surface = mask & ~eroded
-    coords = np.argwhere(surface)
-    return coords, None
+    col_norms = np.sqrt((affine[:3, :3] ** 2).sum(axis=0))
+    return float(col_norms.mean())
 
 
-# ── Downsampling ──────────────────────────────────────────────────────────────
-
-def downsample_vol(vol, target_size=64):
-    """Downsample label volume to target_size^3 for 3D display using nearest-neighbour."""
-    current = np.array(vol.shape)
-    factor = target_size / current.max()
-    if factor >= 1.0:
-        return vol
-    if HAS_SCIPY:
-        return zoom(vol, factor, order=0).astype(np.uint8)
-    # Numpy fallback: simple stride sampling
-    s = max(1, int(1 / factor))
-    return vol[::s, ::s, ::s].astype(np.uint8)
+def update_affine_for_downsample(affine, factor):
+    """
+    Scale the spatial part of the affine to reflect larger voxels.
+    Multiplies the rotation/scale columns by 1/factor (voxels are bigger).
+    """
+    new_affine = affine.copy().astype(np.float64)
+    new_affine[:3, :3] /= factor
+    return new_affine
 
 
-# ── Slice colouring ───────────────────────────────────────────────────────────
-
-def label_slice_to_rgb(slice_2d):
-    """Convert a 2D label slice to an RGB image using SLICE_COLORS."""
-    clipped = np.clip(slice_2d, 0, len(SLICE_COLORS) - 1)
-    return SLICE_COLORS[clipped, :3]
-
-
-# ── Main viewer ───────────────────────────────────────────────────────────────
-
-class Viewer5TT:
-    def __init__(self, vol, affine, subject_name):
-        self.vol = vol.astype(np.uint8)
-        self.affine = affine
-        self.subject = subject_name
-        self.shape = vol.shape
-
-        # Current crosshair position
-        self.cx = self.shape[0] // 2
-        self.cy = self.shape[1] // 2
-        self.cz = self.shape[2] // 2
-
-        # Tissue visibility (mutable copy)
-        self.visible = {k: v["show"] for k, v in TISSUES.items()}
-
-        self._build_ui()
-
-    # ── UI construction ───────────────────────────────────────────────────────
-
-    def _build_ui(self):
-        self.fig = plt.figure(figsize=(18, 10), facecolor="#1a1a2e")
-        self.fig.canvas.manager.set_window_title(f"5TT Viewer — {self.subject}")
-
-        # Grid: 3 slice panels | 1 3D panel | 1 controls panel
-        gs = self.fig.add_gridspec(
-            3, 5,
-            left=0.04, right=0.98, top=0.93, bottom=0.08,
-            wspace=0.35, hspace=0.4,
-            width_ratios=[1, 1, 1, 1.4, 0.55]
-        )
-
-        ax_style = dict(facecolor="#0d0d1a")
-
-        self.ax_ax  = self.fig.add_subplot(gs[0, 0], **ax_style)   # axial
-        self.ax_cor = self.fig.add_subplot(gs[0, 1], **ax_style)   # coronal
-        self.ax_sag = self.fig.add_subplot(gs[0, 2], **ax_style)   # sagittal
-        self.ax_3d  = self.fig.add_subplot(gs[:, 3], projection="3d", facecolor="#0d0d1a")
-        self.ax_ctrl= self.fig.add_subplot(gs[1:, 4])
-        self.ax_ctrl.set_visible(False)
-
-        # Slice sliders
-        slider_kw = dict(color="#3a3a5c", track_color="#1a1a2e")
-        self.sl_ax  = Slider(self.fig.add_axes([0.04, 0.04, 0.17, 0.018]),
-                             "Axial Z",    0, self.shape[2]-1, valinit=self.cz,  valstep=1, **slider_kw)
-        self.sl_cor = Slider(self.fig.add_axes([0.25, 0.04, 0.17, 0.018]),
-                             "Coronal Y",  0, self.shape[1]-1, valinit=self.cy,  valstep=1, **slider_kw)
-        self.sl_sag = Slider(self.fig.add_axes([0.46, 0.04, 0.17, 0.018]),
-                             "Sagittal X", 0, self.shape[0]-1, valinit=self.cx,  valstep=1, **slider_kw)
-
-        self.sl_ax.on_changed(self._on_slider)
-        self.sl_cor.on_changed(self._on_slider)
-        self.sl_sag.on_changed(self._on_slider)
-
-        # Tissue checkboxes
-        labels_vis = [f"  {TISSUES[i]['name']}" for i in range(1, 6)]
-        check_ax = self.fig.add_axes([0.875, 0.25, 0.11, 0.35], facecolor="#0d0d1a")
-        self.checks = CheckButtons(
-            check_ax, labels_vis,
-            actives=[self.visible[i] for i in range(1, 6)]
-        )
-        # Support both old (.rectangles) and new (.patches) matplotlib API
-        _check_boxes = getattr(self.checks, "patches", None) or getattr(self.checks, "rectangles", [])
-        for i, rect in enumerate(_check_boxes):
-            rect.set_facecolor(TISSUES[i+1]["color"])
-            rect.set_edgecolor("#ffffff")
-        for txt in self.checks.labels:
-            txt.set_color("#e0e0e0")
-            txt.set_fontsize(8)
-        self.checks.on_clicked(self._on_check)
-
-        # Legend
-        legend_ax = self.fig.add_axes([0.875, 0.62, 0.11, 0.28], facecolor="#0d0d1a")
-        legend_ax.set_axis_off()
-        patches = [
-            mpatches.Patch(facecolor=TISSUES[i]["color"], edgecolor="#555", label=TISSUES[i]["name"])
-            for i in range(1, 6)
-        ]
-        legend_ax.legend(handles=patches, loc="upper left", fontsize=7,
-                         facecolor="#1a1a2e", edgecolor="#555",
-                         labelcolor="#e0e0e0", framealpha=0.8)
-
-        # Title
-        self.fig.text(0.5, 0.97, f"5-Tissue Segmentation — {self.subject}",
-                      ha="center", va="top", color="#b4befe", fontsize=13, fontweight="bold")
-
-        # Stats text
-        self._stats_ax = self.fig.add_axes([0.875, 0.06, 0.11, 0.17], facecolor="#0d0d1a")
-        self._stats_ax.set_axis_off()
-        self._draw_stats()
-
-        # Connect click events
-        self.fig.canvas.mpl_connect("button_press_event", self._on_click)
-
-        # Initial draw
-        self._draw_slices()
-        self._draw_3d()
-
-    # ── Stats panel ───────────────────────────────────────────────────────────
-
-    def _draw_stats(self):
-        self._stats_ax.cla()
-        self._stats_ax.set_axis_off()
-        total = self.vol.size
-        lines = ["Voxel counts\n"]
-        for i in range(1, 6):
-            n = int((self.vol == i).sum())
-            pct = 100 * n / total
-            lines.append(f"{TISSUES[i]['name'][:10]}\n  {n:,} ({pct:.1f}%)")
-        self._stats_ax.text(0.05, 0.98, "\n".join(lines),
-                            transform=self._stats_ax.transAxes,
-                            va="top", ha="left", fontsize=6.5, color="#a0a0c0",
-                            fontfamily="monospace")
-
-    # ── Slice drawing ─────────────────────────────────────────────────────────
-
-    def _draw_slices(self):
-        # Mask invisible labels
-        vol = self.vol.copy()
-        for label, vis in self.visible.items():
-            if not vis:
-                vol[vol == label] = 0
-
-        axial   = label_slice_to_rgb(vol[:, :, self.cz].T)
-        coronal = label_slice_to_rgb(vol[:, self.cy, :].T)
-        sagittal= label_slice_to_rgb(vol[self.cx, :, :].T)
-
-        for ax, img, title in [
-            (self.ax_ax,  axial,    f"Axial  z={self.cz}"),
-            (self.ax_cor, coronal,  f"Coronal  y={self.cy}"),
-            (self.ax_sag, sagittal, f"Sagittal  x={self.cx}"),
-        ]:
-            ax.cla()
-            ax.imshow(img, origin="lower", aspect="equal", interpolation="nearest")
-            ax.set_title(title, color="#b4befe", fontsize=8, pad=3)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            for spine in ax.spines.values():
-                spine.set_edgecolor("#3a3a5c")
-
-        # Crosshairs
-        def _cross(ax, h, v, hlim, vlim):
-            ax.axhline(h, color="#f38ba8", linewidth=0.6, alpha=0.7)
-            ax.axvline(v, color="#f38ba8", linewidth=0.6, alpha=0.7)
-
-        _cross(self.ax_ax,  self.cy, self.cx, self.shape[1], self.shape[0])
-        _cross(self.ax_cor, self.cz, self.cx, self.shape[2], self.shape[0])
-        _cross(self.ax_sag, self.cz, self.cy, self.shape[2], self.shape[1])
-
-        self.fig.canvas.draw_idle()
-
-    # ── 3D drawing ────────────────────────────────────────────────────────────
-
-    def _draw_3d(self):
-        ax = self.ax_3d
-        ax.cla()
-        ax.set_facecolor("#0d0d1a")
-        ax.set_xlabel("X", color="#666", fontsize=7)
-        ax.set_ylabel("Y", color="#666", fontsize=7)
-        ax.set_zlabel("Z", color="#666", fontsize=7)
-        ax.tick_params(colors="#444", labelsize=6)
-        ax.set_title("3D Overview", color="#b4befe", fontsize=9, pad=4)
-
-        # Downsample for performance
-        small = downsample_vol(self.vol, target_size=60)
-        scale = np.array(self.shape) / np.array(small.shape)
-
-        # Draw tissues outer → inner so transparency looks right
-        for label in [5, 4, 3, 2, 1]:
-            if not self.visible.get(label, True):
-                continue
-            t = TISSUES[label]
-            mask = small == label
-            if not mask.any():
-                continue
-
-            verts, faces = extract_surface_marching_cubes(mask, step=1)
-
-            if faces is not None:
-                # Full marching cubes mesh
-                verts_scaled = verts * scale
-                mesh = Poly3DCollection(
-                    verts_scaled[faces],
-                    alpha=t["alpha"],
-                    linewidth=0,
-                )
-                mesh.set_facecolor(t["color"])
-                mesh.set_edgecolor("none")
-                ax.add_collection3d(mesh)
-            else:
-                # Scatter fallback
-                coords = verts * scale
-                # Subsample points for speed
-                idx = np.random.choice(len(coords), min(len(coords), 2000), replace=False)
-                ax.scatter(
-                    coords[idx, 0], coords[idx, 1], coords[idx, 2],
-                    c=[t["color"]], s=1, alpha=t["alpha"] * 2,
-                    depthshade=True
-                )
-
-        sh = np.array(self.shape)
-        ax.set_xlim(0, sh[0])
-        ax.set_ylim(0, sh[1])
-        ax.set_zlim(0, sh[2])
-        ax.set_box_aspect([sh[0], sh[1], sh[2]])
-
-        # Draw crosshair planes
-        for spine in [ax.xaxis, ax.yaxis, ax.zaxis]:
-            spine.pane.fill = False
-            spine.pane.set_edgecolor("#222244")
-
-        self.fig.canvas.draw_idle()
-
-    # ── Event handlers ────────────────────────────────────────────────────────
-
-    def _on_slider(self, val):
-        self.cz = int(self.sl_ax.val)
-        self.cy = int(self.sl_cor.val)
-        self.cx = int(self.sl_sag.val)
-        self._draw_slices()
-
-    def _on_check(self, label):
-        name = label.strip()
-        for i, t in TISSUES.items():
-            if t["name"] == name:
-                self.visible[i] = not self.visible[i]
-                break
-        self._draw_slices()
-        self._draw_3d()
-
-    def _on_click(self, event):
-        if event.inaxes == self.ax_ax:
-            self.cx = int(np.clip(event.xdata, 0, self.shape[0]-1))
-            self.cy = int(np.clip(event.ydata, 0, self.shape[1]-1))
-            self.sl_sag.set_val(self.cx)
-            self.sl_cor.set_val(self.cy)
-        elif event.inaxes == self.ax_cor:
-            self.cx = int(np.clip(event.xdata, 0, self.shape[0]-1))
-            self.cz = int(np.clip(event.ydata, 0, self.shape[2]-1))
-            self.sl_sag.set_val(self.cx)
-            self.sl_ax.set_val(self.cz)
-        elif event.inaxes == self.ax_sag:
-            self.cy = int(np.clip(event.xdata, 0, self.shape[1]-1))
-            self.cz = int(np.clip(event.ydata, 0, self.shape[2]-1))
-            self.sl_cor.set_val(self.cy)
-            self.sl_ax.set_val(self.cz)
-        self._draw_slices()
-
-    def show(self):
-        plt.show()
+def downsample_labels(vol, factor):
+    """Nearest-neighbour downsample — preserves discrete label values."""
+    if abs(factor - 1.0) < 1e-6:
+        return vol.copy()
+    return zoom(vol.astype(np.float32), factor, order=0).astype(np.uint8)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+def build_mcx_json(vol_shape, bin_filename, res_mm):
+    props = []
+    for label in sorted(MCX_OPTICAL_PROPS.keys()):
+        p = MCX_OPTICAL_PROPS[label]
+        props.append({"mua": p[0], "mus": p[1], "g": p[2], "n": p[3]})
+    return {
+        "_comment": (
+            f"MCX Domain section for 5TT volume at {res_mm}mm resolution. "
+            "Adjust optical properties for your wavelength. "
+            "Add Session, Optode, and Forward sections for a complete input file."
+        ),
+        "Domain": {
+            "VolumeFile": bin_filename,
+            "Dim": list(vol_shape),
+            "VoxelSize": res_mm,
+            "BackgroundFlag": 0,
+            "Media": props,
+        },
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualise a FreeSurfer 5-tissue-type label volume (5tt.mgz)"
+        description="Downsample 5tt.mgz and export for MCX Monte Carlo simulation"
     )
-    parser.add_argument(
-        "path", nargs="?",
-        help="Path to 5tt.mgz. If omitted, searches output/ for any 5tt.mgz."
-    )
+    parser.add_argument("path", help="Path to 5tt.mgz")
+    parser.add_argument("--res", type=float, default=2.0,
+                        help="Target resolution in mm (default: 2)")
+    parser.add_argument("--out", type=str, default=None,
+                        help="Output directory (default: same as input)")
     args = parser.parse_args()
 
-    path = args.path
-
-    # Auto-discover if no path given
-    if not path:
-        for root, dirs, files in os.walk("output"):
-            for f in files:
-                if f == "5tt.mgz":
-                    path = os.path.join(root, f)
-                    print(f"[INFO] Found: {path}")
-                    break
-            if path:
-                break
-
-    if not path or not os.path.exists(path):
-        print("[ERROR] 5tt.mgz not found.")
-        print("Usage: python visualize_5tt.py <path/to/5tt.mgz>")
+    if not os.path.exists(args.path):
+        print(f"[ERROR] File not found: {args.path}")
         sys.exit(1)
 
-    print(f"[INFO] Loading {path} ...")
-    img = nib.load(path)
+    out_dir = args.out if args.out else os.path.dirname(os.path.abspath(args.path))
+    os.makedirs(out_dir, exist_ok=True)
+
+    res_mm = args.res
+    tag = f"{res_mm:.0f}mm" if res_mm == int(res_mm) else f"{res_mm}mm"
+
+    # ── Load ──────────────────────────────────────────────────────────────────
+    print(f"[INFO] Loading {args.path} ...")
+    img = nib.load(args.path)
     vol = np.asarray(img.dataobj, dtype=np.uint8)
     affine = img.affine
 
-    print(f"[INFO] Volume shape: {vol.shape}")
-    print(f"[INFO] Label distribution:")
-    for i, t in TISSUES.items():
-        n = int((vol == i).sum())
-        print(f"        {i} = {t['name']:15s}: {n:>12,} voxels")
+    # Use column norms — correct for FreeSurfer rotated affines
+    current_res = get_voxel_size_mm(affine)
+    factor = current_res / res_mm
 
-    # Try to get subject name from path
-    parts = os.path.normpath(path).split(os.sep)
-    subject = parts[-3] if len(parts) >= 3 else os.path.basename(os.path.dirname(path))
+    print(f"[INFO] Input  resolution : {current_res:.4f} mm  (from affine column norms)")
+    print(f"[INFO] Target resolution : {res_mm:.2f} mm")
+    print(f"[INFO] Downsample factor : {factor:.6f}")
+    print(f"[INFO] Input  shape      : {vol.shape}")
 
-    print(f"\n[INFO] Opening viewer for subject: {subject}")
-    print("[INFO] 3D view may take 10-30 seconds to render...")
+    # ── Downsample ────────────────────────────────────────────────────────────
+    if abs(factor - 1.0) > 1e-4:
+        direction = "Downsampling" if factor < 1.0 else "Upsampling"
+        if factor > 1.0:
+            print("[WARN] Target resolution is finer than input — upsampling adds no information.")
+        else:
+            print("[INFO] Downsampling (nearest-neighbour, label-preserving) ...")
+        vol_ds = downsample_labels(vol, factor)
+    else:
+        print("[INFO] Resolution matches input — no resampling needed.")
+        vol_ds = vol.copy()
 
-    matplotlib.rcParams["figure.facecolor"] = "#1a1a2e"
-    matplotlib.rcParams["text.color"] = "#e0e0e0"
+    affine_ds = update_affine_for_downsample(affine, factor)
+    print(f"[INFO] Output shape      : {vol_ds.shape}")
 
-    viewer = Viewer5TT(vol, affine, subject)
-    viewer.show()
+    # ── Label statistics ──────────────────────────────────────────────────────
+    print()
+    print("[INFO] Label distribution after downsampling:")
+    total = vol_ds.size
+    for label, name in TISSUES.items():
+        n_before = int((vol == label).sum())
+        n_after  = int((vol_ds == label).sum())
+        pct = 100 * n_after / total
+        ratio = n_after / n_before if n_before > 0 else 0.0
+        print(f"        {label} = {name:15s}: {n_after:>10,} voxels "
+              f"({pct:5.1f}%)  [was {n_before:,}, ratio {ratio:.3f}]")
+
+    # ── Save .mgz ─────────────────────────────────────────────────────────────
+    mgz_path = os.path.join(out_dir, f"5tt_{tag}.mgz")
+    print(f"\n[INFO] Saving {mgz_path} ...")
+    out_img = nib.MGHImage(vol_ds, affine_ds, img.header)
+    nib.save(out_img, mgz_path)
+    print(f"[OK]   Saved MGZ : {mgz_path}")
+
+    # ── Save raw .bin for MCX ─────────────────────────────────────────────────
+    # MCX reads volumes in Fortran (column-major) order by default (-a 0)
+    bin_filename = f"5tt_{tag}.bin"
+    bin_path = os.path.join(out_dir, bin_filename)
+    print(f"[INFO] Saving {bin_path} ...")
+    vol_ds.astype(np.uint8).flatten(order='F').tofile(bin_path)
+    size_mb = os.path.getsize(bin_path) / 1024 / 1024
+    print(f"[OK]   Saved BIN : {bin_path}  ({size_mb:.1f} MB)")
+
+    # ── Save MCX JSON snippet ─────────────────────────────────────────────────
+    json_path = os.path.join(out_dir, f"5tt_{tag}_mcx_domain.json")
+    mcx_data = build_mcx_json(list(vol_ds.shape), bin_filename, res_mm)
+    with open(json_path, "w") as f:
+        json.dump(mcx_data, f, indent=2)
+    print(f"[OK]   Saved MCX JSON snippet : {json_path}")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    sx, sy, sz = vol_ds.shape
+    speedup = int(round((1 / factor) ** 3)) if factor < 1 else 1
+    print()
+    print("=" * 60)
+    print(f"  Resolution : {res_mm} mm isotropic")
+    print(f"  Dimensions : {sx} x {sy} x {sz} voxels")
+    print(f"  FOV        : {sx*res_mm:.0f} x {sy*res_mm:.0f} x {sz*res_mm:.0f} mm")
+    if speedup > 1:
+        print(f"  Speedup vs {current_res:.0f}mm : ~{speedup}x fewer voxels")
+    print()
+    print("  Output files:")
+    print(f"    {os.path.basename(mgz_path):<35} Downsampled label volume")
+    print(f"    {bin_filename:<35} MCX raw binary (Fortran order)")
+    print(f"    {os.path.basename(json_path):<35} MCX Domain JSON snippet")
+    print("=" * 60)
+    print()
+    print("[INFO] To run with MCX:")
+    print(f'         mcx -f simulation.json')
+    print(f'  where simulation.json includes:')
+    print(f'         "VolumeFile": "{bin_filename}"')
+    print(f'         "Dim": {list(vol_ds.shape)}')
+    print(f'         "VoxelSize": {res_mm}')
 
 
 if __name__ == "__main__":
